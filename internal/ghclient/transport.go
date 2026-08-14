@@ -32,13 +32,6 @@ func cloneTransport(tr http.RoundTripper, opts ClientOptions) http.RoundTripper 
 func newTransport(tokenSource oauth2.TokenSource, opts ClientOptions) (http.RoundTripper, error) {
 	tr := cloneTransport(http.DefaultTransport, opts)
 
-	if tokenSource != nil {
-		tr = &oauth2.Transport{
-			Base:   tr,
-			Source: tokenSource,
-		}
-	}
-
 	tr = logging.NewLoggingHTTPTransport(tr)
 
 	if opts.RetryMax > 0 {
@@ -65,6 +58,15 @@ func newTransport(tokenSource oauth2.TokenSource, opts ClientOptions) (http.Roun
 		}
 
 		tr = ghct.NewTransport(store, tr)
+	}
+
+	// The oauth2 transport must be the outermost layer so the conditional cache transport observes the
+	// Authorization header GitHub varies its ETags on.
+	if tokenSource != nil {
+		tr = &oauth2.Transport{
+			Base:   tr,
+			Source: tokenSource,
+		}
 	}
 
 	return tr, nil
