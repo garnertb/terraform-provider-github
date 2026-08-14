@@ -104,30 +104,62 @@ against an `httptest.Server` that mimics GitHub: it requires `Authorization`, ad
 The pre-existing `transport_caches_requests` subtest passes under both orderings because it uses no
 token source, which is why the bug went unnoticed.
 
-## Follow-up: `Authorization` is now visible to the logging transport
-
-**This needs a decision before release.**
+## Follow-up (fixed): `Authorization` was visible to the logging transport
 
 `oauth2.Transport` used to sit *inside* `logging.NewLoggingHTTPTransport`, so the logging transport
-ran first and dumped the request before the credential was attached. With oauth2 now outermost, the
-logging transport sees the fully-authenticated request.
+ran first and dumped the request before the credential was attached — redaction by accident. With
+oauth2 now outermost, the logging transport sees the fully-authenticated request.
 
 `helper/logging.NewLoggingHTTPTransport` (terraform-plugin-sdk v2.40.1) calls
-`httputil.DumpRequestOut(req, true)` and turns every header into a `tflog` field. It performs no
-redaction of its own, and this repository configures no `tflog` masking
-(`MaskFieldValuesWithFieldKeys` / `MaskAllFieldValuesRegexes` appear nowhere in the tree).
+`httputil.DumpRequestOut(req, true)` at `logging_http_transport.go:201` and turns every header into a
+`tflog` field via `fieldHeadersFromRequestReader`. Neither it nor the standard library redacts
+anything: on Go 1.26.0, `DumpRequestOut` emits `Authorization` verbatim (verified directly). So with
+`TF_LOG_PROVIDER=DEBUG` the reorder would have written the raw token to the provider log.
 
-Consequence: with `TF_LOG_PROVIDER=DEBUG`, the raw token is now written to the provider log. Options:
+### What was done
 
-1. Configure `tflog` masking for the `Authorization` field key (and the raw request/response body
-   fields, which also contain the header via `DumpRequestOut`).
-2. Insert a thin RoundTripper below `oauth2` that strips or replaces `Authorization` on the copy
-   handed to the logging transport.
-3. Move the logging transport above `oauth2` — restores the old redaction-by-accident, but it would
-   then log requests before `ghct` adds `If-None-Match` and before retry, and would log
-   cache-served responses rather than wire responses.
+`newTransport` now wraps the logging transport in a `maskingTransport`, which applies
+`tflog.MaskFieldValuesWithFieldKeys(req.Context(), "Authorization")` to the request context before
+delegating. The wrap happens at the point the logging transport is constructed, so nothing can be
+reordered between the two later.
 
-Option 1 is the smallest and keeps log fidelity, but none of these were implemented here.
+### Why not mask at provider configuration time
+
+`tflog.MaskFieldValuesWithFieldKeys` (terraform-plugin-log v0.11.0, `tflog/provider.go:225`) stores
+the masking options in the context it returns; there is no global state. For that mask to apply, the
+returned context has to be the one the transport logs against — `req.Context()`.
+
+It cannot be. `helper/schema.ConfigureContextFunc` is
+`func(context.Context, *ResourceData) (interface{}, diag.Diagnostics)` (`helper/schema/provider.go:178`)
+— no context out-parameter, so a masked context built during `Configure` is unreturnable. And each
+CRUD RPC derives its own context from its own incoming gRPC context via `logging.InitContext(ctx)`
+(`helper/schema/grpc_provider.go:724`, `:798`, `:1359`), so it would not inherit one even if it could
+be stored.
+
+Masking at `Configure` would therefore compile, run, and do nothing — a fix that appears to work while
+the credential still leaks. `Test_newTransport/logging_transport_leaks_authorization_without_in_chain_masking`
+pins this: it masks one context, logs a control entry through it (asserting that entry *is* masked, so
+the sink is provably working), then issues a request on an unmasked context through an unmasked chain
+and asserts the token appears verbatim.
+
+### Why not move logging above oauth2
+
+That restores the old redaction-by-accident but loses the transport's stated purpose. Logging would
+run before `ghct` adds `If-None-Match`, before retry, and before rate limiting — so it would show
+neither conditional requests, nor 304 revalidations, nor retried attempts, and would log
+cache-served responses instead of wire responses. Rejected.
+
+### Scope and a note for reviewers
+
+The mask covers the `Authorization` field key only. `DumpRequestOut` puts headers in the dump, but the
+SDK consumes them into discrete fields with `ReadMIMEHeader` before the remainder becomes
+`tf_http_req_body`, so the body field does not carry the credential. Response fields never do.
+
+An alternative worth considering upstream: apply the mask once at the provider's `tflog` sink instead
+of scoped to this chain. That is defence in depth — it would catch any future transport or code path
+that logs headers — at the cost of being a provider-wide policy rather than a local guarantee. The
+chain-scoped version is implemented here because it is self-contained and testable; the broader
+version is a maintainer's call.
 
 ## Note on branch base
 
