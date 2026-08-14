@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	ghct "github.com/bored-engineer/github-conditional-http-transport"
 	"golang.org/x/oauth2"
 	"golang.org/x/sync/semaphore"
 )
@@ -393,4 +394,150 @@ func Test_newTransport(t *testing.T) {
 			t.Fatalf("expected cached response to not match last response, got %q and %q", string(b3), string(b2))
 		}
 	})
+
+	t.Run("transport_caches_authenticated_requests", func(t *testing.T) {
+		t.Parallel()
+
+		srv := newVaryingETagServer(t)
+
+		opts := ClientOptions{Cache: true, CachePath: mustMkdirTemp(t, cacheBasePath, "*")}
+		tr, err := newTransport(oauth2.StaticTokenSource(&oauth2.Token{AccessToken: testETagServerToken}), opts)
+		if err != nil {
+			t.Fatalf("failed to create transport: %v", err)
+		}
+
+		client := &http.Client{Transport: tr}
+
+		b1, res1 := mustGet(t, client, srv.URL)
+		if res1.Header.Get("X-Cache") != "MISS" {
+			t.Fatalf("expected first response to be a cache miss, got %q", res1.Header.Get("X-Cache"))
+		}
+
+		b2, res2 := mustGet(t, client, srv.URL)
+
+		if srv.unauthorized.Load() != 0 {
+			t.Fatalf("expected no unauthorized requests, got %d", srv.unauthorized.Load())
+		}
+
+		if srv.notModified.Load() != 1 {
+			t.Fatalf("expected 1 revalidated (304) request, got %d", srv.notModified.Load())
+		}
+
+		if res2.Header.Get("X-Cache") != "HIT" {
+			t.Fatalf("expected second response to be a cache hit, got %q", res2.Header.Get("X-Cache"))
+		}
+
+		if b2 != b1 {
+			t.Fatalf("expected cached response to match first response, got %q and %q", b2, b1)
+		}
+	})
+
+	// Pins the regression fixed by moving the oauth2 transport outside the cache transport: when the
+	// cache transport runs first it never sees the Authorization header GitHub varies its ETags on, so
+	// it stores no X-Varied-Authorization marker and sends a recomputed, mismatching If-None-Match.
+	t.Run("cache_transport_inside_oauth2_never_revalidates", func(t *testing.T) {
+		t.Parallel()
+
+		srv := newVaryingETagServer(t)
+
+		store, err := createCacheStore(mustMkdirTemp(t, cacheBasePath, "*"))
+		if err != nil {
+			t.Fatalf("failed to create cache store: %v", err)
+		}
+		t.Cleanup(func() {
+			_ = store.DB.Close()
+		})
+
+		tokenSource := oauth2.StaticTokenSource(&oauth2.Token{AccessToken: testETagServerToken})
+		client := &http.Client{Transport: ghct.NewTransport(store, &oauth2.Transport{
+			Base:   cloneTransport(http.DefaultTransport, ClientOptions{}),
+			Source: tokenSource,
+		})}
+
+		b1, _ := mustGet(t, client, srv.URL)
+		b2, res2 := mustGet(t, client, srv.URL)
+
+		if srv.unauthorized.Load() != 0 {
+			t.Fatalf("expected no unauthorized requests, got %d", srv.unauthorized.Load())
+		}
+
+		if srv.notModified.Load() != 0 {
+			t.Fatalf("expected the legacy ordering to never revalidate, got %d 304 responses", srv.notModified.Load())
+		}
+
+		if res2.Header.Get("X-Cache") != "MISS" {
+			t.Fatalf("expected the legacy ordering to miss, got %q", res2.Header.Get("X-Cache"))
+		}
+
+		if b2 == b1 {
+			t.Fatalf("expected the legacy ordering to refetch the body, got %q twice", b2)
+		}
+	})
+}
+
+const (
+	testETagServerToken = "test-token"
+	testETagServerETag  = `"varying-etag"`
+)
+
+// varyingETagServer is an httptest.Server that mimics GitHub's conditional request behaviour: it
+// requires an Authorization header, advertises that its ETags vary on Accept and Authorization, and
+// only answers 304 when the exact ETag it issued is echoed back in If-None-Match.
+type varyingETagServer struct {
+	*httptest.Server
+
+	unauthorized atomic.Int32
+	notModified  atomic.Int32
+	served       atomic.Int32
+}
+
+func newVaryingETagServer(t *testing.T) *varyingETagServer {
+	t.Helper()
+
+	srv := &varyingETagServer{}
+	srv.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer "+testETagServerToken {
+			srv.unauthorized.Add(1)
+			w.WriteHeader(http.StatusUnauthorized)
+
+			return
+		}
+
+		w.Header().Set("Vary", "Accept, Authorization")
+		w.Header().Set("Etag", testETagServerETag)
+
+		if r.Header.Get("If-None-Match") == testETagServerETag {
+			srv.notModified.Add(1)
+			w.WriteHeader(http.StatusNotModified)
+
+			return
+		}
+
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(strconv.Itoa(int(srv.served.Add(1)))))
+	}))
+	t.Cleanup(srv.Close)
+
+	return srv
+}
+
+func mustGet(t *testing.T, client *http.Client, url string) (string, *http.Response) {
+	t.Helper()
+
+	res, err := client.Get(url)
+	if err != nil {
+		t.Fatalf("failed to make request: %v", err)
+	}
+	defer res.Body.Close()
+
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("expected status code %d, got %d", http.StatusOK, res.StatusCode)
+	}
+
+	body, err := io.ReadAll(res.Body)
+	if err != nil {
+		t.Fatalf("failed to read response body: %v", err)
+	}
+
+	return string(body), res
 }
