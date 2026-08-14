@@ -11,12 +11,13 @@ The conditional-request cache transport
 ~0% cache hit rate. Because every real user of the provider is authenticated, the feature was
 effectively inert: no `304 Not Modified` responses were ever served from the cache.
 
-This was not limited to users who set `cache_path`. `github/provider.go` sets `Cache: true`
-unconditionally for the non-legacy client, and when `cache_path` is unset the source constructors
-fall back to `os.MkdirTemp` (`token.go:21`, `app.go:45`, `anonymous.go:21`). `cache_path` only
-chooses where the cache lives and whether it survives between runs — it does not enable caching.
-So the bug degraded every `legacy_client = false` user; `cache_path` users additionally lost the
-cross-run reuse that is the option's whole point.
+**This affected every `legacy_client = false` user, not just those who set `cache_path`.**
+`github/provider.go:613` sets `Cache: true` unconditionally for the non-legacy client, and when
+`cache_path` is unset the source constructors fall back to `os.MkdirTemp` (`token.go:21`,
+`app.go:45`, `anonymous.go:21`). Caching is therefore always on; `cache_path`'s function is
+cross-process persistence — choosing where the cache lives so it survives between runs — not
+enabling the cache. Users who set it lost that cross-run reuse on top of the in-run loss everyone
+else took.
 
 ## Mechanism
 
@@ -70,10 +71,28 @@ ratelimit -> throttler -> retry -> oauth2 -> ghct -> logging -> base
 `ghct` now sees the `Authorization` header, writes the `X-Varied-Authorization` marker, matches it on
 reuse, and sends the stored ETag verbatim as `If-None-Match`.
 
-The first attempt at this was a straight move of the `oauth2.Transport` block to the outermost
-position. That fixed the cache but introduced a credential-freshness regression; see
-[Token freshness](#token-freshness-why-oauth2-is-not-the-outermost-layer) below for why the final
-placement is inside the waiting layers instead.
+The oauth2 transport's position has to satisfy two independent constraints, and upstream's placement
+satisfied only one of them. The first attempt at this fix was a straight move to the outermost
+position, which traded one constraint for the other:
+
+| placement | cache sees `Authorization` | every wire attempt gets a fresh token |
+| --- | --- | --- |
+| innermost (upstream) | no | yes |
+| outermost (first attempt) | yes | no |
+| between the waiting layers and the cache (current) | yes | yes |
+
+The two constraints pull in opposite directions — the cache needs the credential attached *early*, the
+waiting layers need it attached *late* — but they are not actually in conflict, because the cache is
+not one of the layers that waits. Putting oauth2 between them satisfies both. See
+[Token freshness](#token-freshness-why-oauth2-is-not-the-outermost-layer) for the freshness half.
+
+### Consequence for the debug log
+
+`logging` now sits below `ghct`, so it records wire traffic only — a locally-served cache hit produces
+no log entry. That is the correct semantic for a transport whose purpose is dumping the actual bytes
+sent, but anyone using `TF_LOG_PROVIDER=DEBUG` output to count API requests is counting **wire
+attempts**, not logical requests. In practice the totals barely move between cold and warm runs
+because GitHub conditional requests always revalidate; what changes is the `200`/`304` split.
 
 ## Token freshness: why oauth2 is not the outermost layer
 
@@ -95,7 +114,9 @@ Keeping oauth2 inside the waiting layers restores the guarantee the original ord
 accident: every attempt that reaches the wire carries a token minted moments earlier.
 
 Moving `ghct` below the rate limiter costs nothing. It rewrites only `304` responses; every other
-status passes through untouched (`transport.go:156-193`), so limit detection is unchanged.
+status passes through untouched (`transport.go:156-193`), so a real `403` still reaches limit
+detection intact. Rate limit accounting also stays accurate: the `x-ratelimit-*` headers on a
+revalidation come from the fresh `304`, and the limiter observes them on the way back out.
 
 ## Evidence
 
