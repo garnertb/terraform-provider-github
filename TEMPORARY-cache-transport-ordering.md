@@ -1,15 +1,22 @@
-# TEMPORARY: `cache_path` never produced cache hits for authenticated users
+# TEMPORARY: the conditional request cache never produced cache hits for authenticated users
 
-> **This document is temporary.** It exists to explain a one-line transport ordering fix and the
+> **This document is temporary.** It exists to explain a transport ordering fix and the
 > evidence behind it. Delete it, or fold the relevant parts into `ARCHITECTURE.md` / `DECISIONS.md`,
 > once the change has been reviewed.
 
 ## Symptom
 
-The provider's `cache_path` option enabled the conditional-request cache transport
-(`github.com/bored-engineer/github-conditional-http-transport`, imported as `ghct`) but produced a
+The conditional-request cache transport
+(`github.com/bored-engineer/github-conditional-http-transport`, imported as `ghct`) produced a
 ~0% cache hit rate. Because every real user of the provider is authenticated, the feature was
 effectively inert: no `304 Not Modified` responses were ever served from the cache.
+
+This was not limited to users who set `cache_path`. `github/provider.go` sets `Cache: true`
+unconditionally for the non-legacy client, and when `cache_path` is unset the source constructors
+fall back to `os.MkdirTemp` (`token.go:21`, `app.go:45`, `anonymous.go:21`). `cache_path` only
+chooses where the cache lives and whether it survives between runs — it does not enable caching.
+So the bug degraded every `legacy_client = false` user; `cache_path` users additionally lost the
+cross-run reuse that is the option's whole point.
 
 ## Mechanism
 
@@ -53,15 +60,42 @@ was an accident rather than a deliberate tradeoff.
 
 ## Fix
 
-The `oauth2.Transport` construction moved from the top of `newTransport` to the bottom, immediately
-before `return tr, nil`. The lines themselves are unchanged. Resulting execution order:
+`oauth2.Transport` now sits directly outside `ghct`, and the pair sits inside every layer that can
+wait or re-issue a request. Resulting execution order:
 
 ```
-oauth2 -> ghct -> ratelimit -> throttler -> retry -> logging -> base
+ratelimit -> throttler -> retry -> oauth2 -> ghct -> logging -> base
 ```
 
 `ghct` now sees the `Authorization` header, writes the `X-Varied-Authorization` marker, matches it on
 reuse, and sends the stored ETag verbatim as `If-None-Match`.
+
+The first attempt at this was a straight move of the `oauth2.Transport` block to the outermost
+position. That fixed the cache but introduced a credential-freshness regression; see
+[Token freshness](#token-freshness-why-oauth2-is-not-the-outermost-layer) below for why the final
+placement is inside the waiting layers instead.
+
+## Token freshness: why oauth2 is not the outermost layer
+
+`oauth2.Transport` calls `Source.Token()` once per `RoundTrip`. Placing it outermost stamps the
+credential onto the request *before* the rate limiters, the throttler and the retry client have done
+their waiting — and those layers re-issue the same `*http.Request`, header included:
+
+- `github_secondary_ratelimit` sleeps for the advertised duration and then recurses on the same
+  request (`secondary_rate_limit.go:43-66`).
+- The primary limiter waits until the reset time, which can be up to an hour.
+- `retryablehttp` replays the request after backoff, and its default policy does **not** retry `401`.
+
+GitHub App installation tokens are handed out with as little as 30 seconds of remaining validity
+(`go-githubauth` `DefaultExpirySkew = 30 * time.Second`, `auth.go:36`), so a wait longer than that
+would put a dead credential on the wire and surface as an unretried `401`. Personal access tokens use
+`oauth2.StaticTokenSource` and were never affected.
+
+Keeping oauth2 inside the waiting layers restores the guarantee the original ordering had by
+accident: every attempt that reaches the wire carries a token minted moments earlier.
+
+Moving `ghct` below the rate limiter costs nothing. It rewrites only `304` responses; every other
+status passes through untouched (`transport.go:156-193`), so limit detection is unchanged.
 
 ## Evidence
 
@@ -90,8 +124,8 @@ accepts both the strong (`"hex"`) and weak (`W/"hex"`) `If-None-Match` forms.
 
 ## Test coverage
 
-Two subtests were added to `Test_newTransport` in `internal/ghclient/transport_test.go`. Both run
-against an `httptest.Server` that mimics GitHub: it requires `Authorization`, advertises
+Three subtests were added to `Test_newTransport` in `internal/ghclient/transport_test.go`. The first
+two run against an `httptest.Server` that mimics GitHub: it requires `Authorization`, advertises
 `Vary: Accept, Authorization`, and answers `304` only when the exact ETag it issued is echoed back.
 
 - `transport_caches_authenticated_requests` builds a client through the real `newTransport` with a
@@ -100,15 +134,24 @@ against an `httptest.Server` that mimics GitHub: it requires `Authorization`, ad
   `expected 1 revalidated (304) request, got 0`.
 - `cache_transport_inside_oauth2_never_revalidates` constructs the previous ordering explicitly and
   asserts it never revalidates, pinning the regression.
+- `each_retry_attempt_mints_a_fresh_token` uses a token source that returns a distinct token per
+  call and a server that fails the first attempt, then asserts the retry carried a different
+  credential. With oauth2 outermost it fails with `expected each attempt to carry a freshly minted
+  token, got "Bearer token-1" twice`.
 
 The pre-existing `transport_caches_requests` subtest passes under both orderings because it uses no
 token source, which is why the bug went unnoticed.
 
+Note that the two regression subtests are characterization tests of third-party behaviour:
+`cache_transport_inside_oauth2_never_revalidates` depends on `ghct` continuing to require an
+`Authorization` header, and the logging subtest below depends on the SDK continuing to dump headers
+verbatim. If either dependency changes, those tests will fail even though the provider is correct.
+
 ## Follow-up (fixed): `Authorization` was visible to the logging transport
 
 `oauth2.Transport` used to sit *inside* `logging.NewLoggingHTTPTransport`, so the logging transport
-ran first and dumped the request before the credential was attached — redaction by accident. With
-oauth2 now outermost, the logging transport sees the fully-authenticated request.
+ran first and dumped the request before the credential was attached — redaction by accident. The
+reorder puts oauth2 above logging, so the logging transport now sees the fully-authenticated request.
 
 `helper/logging.NewLoggingHTTPTransport` (terraform-plugin-sdk v2.40.1) calls
 `httputil.DumpRequestOut(req, true)` at `logging_http_transport.go:201` and turns every header into a
