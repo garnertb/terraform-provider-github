@@ -43,6 +43,25 @@ func newTransport(tokenSource oauth2.TokenSource, opts ClientOptions) (http.Roun
 
 	tr = &maskingTransport{inner: logging.NewLoggingHTTPTransport(tr)}
 
+	if opts.Cache {
+		store, err := createCacheStore(opts.CachePath)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create cache store: %w", err)
+		}
+
+		tr = ghct.NewTransport(store, tr)
+	}
+
+	// The oauth2 transport sits directly outside the conditional cache transport so the cache observes the
+	// Authorization header GitHub varies its ETags on, and inside every layer that can wait or re-issue a
+	// request so each attempt reaches the wire with a freshly minted token.
+	if tokenSource != nil {
+		tr = &oauth2.Transport{
+			Base:   tr,
+			Source: tokenSource,
+		}
+	}
+
 	if opts.RetryMax > 0 {
 		retryClient := retryablehttp.NewClient()
 		retryClient.Logger = nil
@@ -59,24 +78,6 @@ func newTransport(tokenSource oauth2.TokenSource, opts ClientOptions) (http.Roun
 	}
 
 	tr = ratelimit.New(tr, ratelimitp.WithLimitDetectedCallback(primaryRateLimitCallback), ratelimits.WithLimitDetectedCallback(secondaryRateLimitCallback))
-
-	if opts.Cache {
-		store, err := createCacheStore(opts.CachePath)
-		if err != nil {
-			return nil, fmt.Errorf("failed to create cache store: %w", err)
-		}
-
-		tr = ghct.NewTransport(store, tr)
-	}
-
-	// The oauth2 transport must be the outermost layer so the conditional cache transport observes the
-	// Authorization header GitHub varies its ETags on.
-	if tokenSource != nil {
-		tr = &oauth2.Transport{
-			Base:   tr,
-			Source: tokenSource,
-		}
-	}
 
 	return tr, nil
 }

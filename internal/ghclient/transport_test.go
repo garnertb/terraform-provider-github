@@ -11,6 +11,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -537,6 +538,67 @@ func Test_newTransport(t *testing.T) {
 			t.Fatalf("expected the token to be absent from the log output, got %q", raw)
 		}
 	})
+
+	// Pins the freshness property the chain order guarantees: every layer that can wait or re-issue a
+	// request runs outside the oauth2 transport, so each attempt mints its own token. With oauth2
+	// outermost the retry replays the token minted before the first attempt, which for GitHub App
+	// installation tokens may already have expired by the time it reaches the wire.
+	t.Run("each_retry_attempt_mints_a_fresh_token", func(t *testing.T) {
+		t.Parallel()
+
+		var (
+			mu   sync.Mutex
+			seen []string
+		)
+
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			mu.Lock()
+			seen = append(seen, r.Header.Get("Authorization"))
+			attempt := len(seen)
+			mu.Unlock()
+
+			if attempt == 1 {
+				w.WriteHeader(http.StatusInternalServerError)
+
+				return
+			}
+
+			w.WriteHeader(http.StatusOK)
+		}))
+		t.Cleanup(srv.Close)
+
+		tr, err := newTransport(&rotatingTokenSource{}, ClientOptions{
+			RetryMax:     1,
+			RetryWaitMin: time.Millisecond,
+			RetryWaitMax: time.Millisecond,
+		})
+		if err != nil {
+			t.Fatalf("failed to create transport: %v", err)
+		}
+
+		mustGet(t, &http.Client{Transport: tr}, srv.URL)
+
+		mu.Lock()
+		defer mu.Unlock()
+
+		if len(seen) != 2 {
+			t.Fatalf("expected the retry to reach the server, got %d requests: %q", len(seen), seen)
+		}
+
+		if seen[0] == seen[1] {
+			t.Fatalf("expected each attempt to carry a freshly minted token, got %q twice", seen[0])
+		}
+	})
+}
+
+// rotatingTokenSource mints a distinct token on every call, mimicking the expiring installation token
+// sources used for GitHub App authentication.
+type rotatingTokenSource struct {
+	calls atomic.Int32
+}
+
+func (s *rotatingTokenSource) Token() (*oauth2.Token, error) {
+	return &oauth2.Token{AccessToken: "token-" + strconv.Itoa(int(s.calls.Add(1)))}, nil
 }
 
 const (
