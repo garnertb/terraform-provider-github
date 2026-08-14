@@ -14,6 +14,15 @@ import (
 	"golang.org/x/oauth2"
 )
 
+// maskingTransport applies tflog Authorization field masking to the request context before delegating. The SDK logging transport dumps every request header as a log field and masking is context-scoped, so it must be attached to the request rather than at provider configuration time.
+type maskingTransport struct {
+	inner http.RoundTripper
+}
+
+func (t *maskingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	return t.inner.RoundTrip(req.Clone(tflog.MaskFieldValuesWithFieldKeys(req.Context(), "Authorization")))
+}
+
 // cloneTransport attempts to clone the given http.RoundTripper if it is an *http.Transport, otherwise it returns the original RoundTripper. Cloning the transport is important to avoid sharing state (such as idle connections) between different clients that use the same base transport.
 func cloneTransport(tr http.RoundTripper, opts ClientOptions) http.RoundTripper {
 	if dtr, ok := tr.(*http.Transport); ok {
@@ -32,7 +41,7 @@ func cloneTransport(tr http.RoundTripper, opts ClientOptions) http.RoundTripper 
 func newTransport(tokenSource oauth2.TokenSource, opts ClientOptions) (http.RoundTripper, error) {
 	tr := cloneTransport(http.DefaultTransport, opts)
 
-	tr = logging.NewLoggingHTTPTransport(tr)
+	tr = &maskingTransport{inner: logging.NewLoggingHTTPTransport(tr)}
 
 	if opts.RetryMax > 0 {
 		retryClient := retryablehttp.NewClient()

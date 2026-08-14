@@ -1,6 +1,8 @@
 package ghclient
 
 import (
+	"bytes"
+	"context"
 	"errors"
 	"io"
 	"net/http"
@@ -8,11 +10,15 @@ import (
 	"os"
 	"regexp"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	ghct "github.com/bored-engineer/github-conditional-http-transport"
+	"github.com/hashicorp/terraform-plugin-log/tflog"
+	"github.com/hashicorp/terraform-plugin-log/tflogtest"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/logging"
 	"golang.org/x/oauth2"
 	"golang.org/x/sync/semaphore"
 )
@@ -473,9 +479,68 @@ func Test_newTransport(t *testing.T) {
 			t.Fatalf("expected the legacy ordering to refetch the body, got %q twice", b2)
 		}
 	})
+
+	// Establishes that tflog masking is scoped to the context it is applied to. SDKv2 gives each RPC
+	// its own context and ConfigureContextFunc returns none, so a mask applied at configure time can
+	// never reach the request context the logging transport logs against.
+	t.Run("logging_transport_leaks_authorization_without_in_chain_masking", func(t *testing.T) {
+		t.Parallel()
+
+		srv := newVaryingETagServer(t)
+
+		var buf bytes.Buffer
+		ctx := tflogtest.RootLogger(t.Context(), &buf)
+
+		tflog.Debug(tflog.MaskFieldValuesWithFieldKeys(ctx, "Authorization"), "configure",
+			map[string]any{"Authorization": "Bearer " + testETagServerToken})
+
+		client := &http.Client{Transport: &oauth2.Transport{
+			Base:   logging.NewLoggingHTTPTransport(cloneTransport(http.DefaultTransport, ClientOptions{})),
+			Source: oauth2.StaticTokenSource(&oauth2.Token{AccessToken: testETagServerToken}),
+		}}
+
+		mustGetWithContext(t, ctx, client, srv.URL)
+
+		entries := mustDecodeLogEntries(t, buf.String())
+
+		if got := logFieldValue(t, entries, "configure", "Authorization"); got != maskedLogValue {
+			t.Fatalf("expected the configure-time context to mask its own fields, got %q", got)
+		}
+
+		if got := logFieldValue(t, entries, "Sending HTTP Request", "Authorization"); got != "Bearer "+testETagServerToken {
+			t.Fatalf("expected an unmasked chain to log the token verbatim, got %q", got)
+		}
+	})
+
+	t.Run("masks_authorization_in_request_logs", func(t *testing.T) {
+		t.Parallel()
+
+		srv := newVaryingETagServer(t)
+
+		var buf bytes.Buffer
+		ctx := tflogtest.RootLogger(t.Context(), &buf)
+
+		tr, err := newTransport(oauth2.StaticTokenSource(&oauth2.Token{AccessToken: testETagServerToken}), ClientOptions{})
+		if err != nil {
+			t.Fatalf("failed to create transport: %v", err)
+		}
+
+		mustGetWithContext(t, ctx, &http.Client{Transport: tr}, srv.URL)
+
+		raw := buf.String()
+
+		if got := logFieldValue(t, mustDecodeLogEntries(t, raw), "Sending HTTP Request", "Authorization"); got != maskedLogValue {
+			t.Fatalf("expected the Authorization field to be masked, got %q", got)
+		}
+
+		if strings.Contains(raw, testETagServerToken) {
+			t.Fatalf("expected the token to be absent from the log output, got %q", raw)
+		}
+	})
 }
 
 const (
+	maskedLogValue      = "***"
 	testETagServerToken = "test-token"
 	testETagServerETag  = `"varying-etag"`
 )
@@ -540,4 +605,68 @@ func mustGet(t *testing.T, client *http.Client, url string) (string, *http.Respo
 	}
 
 	return string(body), res
+}
+
+func mustGetWithContext(t *testing.T, ctx context.Context, client *http.Client, url string) {
+	t.Helper()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		t.Fatalf("failed to create request: %v", err)
+	}
+
+	res, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("failed to make request: %v", err)
+	}
+	defer res.Body.Close()
+
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("expected status code %d, got %d", http.StatusOK, res.StatusCode)
+	}
+
+	if _, err := io.Copy(io.Discard, res.Body); err != nil {
+		t.Fatalf("failed to read response body: %v", err)
+	}
+}
+
+func mustDecodeLogEntries(t *testing.T, raw string) []map[string]any {
+	t.Helper()
+
+	entries, err := tflogtest.MultilineJSONDecode(strings.NewReader(raw))
+	if err != nil {
+		t.Fatalf("failed to decode log output %q: %v", raw, err)
+	}
+
+	if len(entries) == 0 {
+		t.Fatal("expected log entries, got none")
+	}
+
+	return entries
+}
+
+func logFieldValue(t *testing.T, entries []map[string]any, message, field string) string {
+	t.Helper()
+
+	for _, entry := range entries {
+		if entry["@message"] != message {
+			continue
+		}
+
+		value, ok := entry[field]
+		if !ok {
+			t.Fatalf("log entry %q has no %q field", message, field)
+		}
+
+		s, ok := value.(string)
+		if !ok {
+			t.Fatalf("expected the %q field to be a string, got %T", field, value)
+		}
+
+		return s
+	}
+
+	t.Fatalf("found no log entry with message %q", message)
+
+	return ""
 }
