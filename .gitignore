@@ -30,6 +30,10 @@ testdata/
 website/vendor
 terraform-provider-github
 
+# Binary produced by `go build ./...` from TEMPORARY-repro/cache-ordering
+# (a main package). Remove this line when that directory is deleted.
+/cache-ordering
+
 # Generated temporary files
 .golangci.new.yml
 
