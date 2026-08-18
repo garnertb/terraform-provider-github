@@ -4,8 +4,7 @@
 
 Every factual claim below links to the source it rests on. Links are commit-pinned:
 `github-conditional-http-transport` at [`94778cb`][ghct-tree] (tags `v0.0.7` and `bbolt/v0.0.2`, both
-the same commit) and this provider at [`67f3fd1`][prov-tree], the `main` commit this branch is based
-on.
+the same commit) and this provider at [`67f3fd1`][prov-tree].
 
 ## Claim
 
@@ -36,23 +35,24 @@ invisible to it, three paths break:
 Result: a cache hit rate of ~0% for authenticated users.
 
 The credential is **not** stripped from the wire. `oauth2` still authenticates; it just does so below
-the cache. This repro asserts that explicitly, because "the cache broke auth" is the wrong diagnosis
-and would send a maintainer to the wrong file.
+the cache. The harness asserts this explicitly, since "the cache broke auth" is a plausible-sounding
+but incorrect reading of the symptom and leads to the wrong file.
 
 ## Running it
 
 ```sh
-export PATH="/opt/homebrew/bin:$PATH"   # macOS/Homebrew only; needed if go is not on PATH
 export GOTOOLCHAIN=auto                 # go.mod requires a recent toolchain
+export PATH="/opt/homebrew/bin:$PATH"   # only if go is not already on PATH
 
-# Hermetic: no credentials, no network. This is the primary deliverable.
+# Hermetic: no credentials, no network.
 go run ./TEMPORARY-repro/cache-ordering
 
-# Also exercise the real api.github.com.
+# Optional: the same comparison against the real api.github.com.
 GITHUB_TOKEN=$(gh auth token) go run ./TEMPORARY-repro/cache-ordering -live
 ```
 
-The program exits non-zero if any assertion fails.
+The program exits non-zero if any assertion fails. Live mode skips cleanly when `GITHUB_TOKEN` is
+unset, and issues eight requests total against a read-only endpoint.
 
 ## What it builds
 
@@ -114,10 +114,16 @@ assertions guard that, and all of them are hard failures:
    not as a finding.
 5. **The provider matches `upstream`.** Zero hits, zero origin `304`s, entry stored, marker absent.
 
-Guard 2 is the load-bearing one. Guards 2 and 5 are what would fail if the fix were reverted.
+Guard 2 is the load-bearing one: it is what separates "the cache is sending a wrong validator" from
+the several other reasons a hit rate could be zero.
 
 Guard 2 checks the *stored marker*, not the size of the database file. A bbolt file is non-empty the
 moment it is [created and its bucket initialised][bbolt-open], so file size would prove nothing.
+
+**Once the ordering is corrected, guard 5 fails.** That is intended, and it is the quickest way to
+confirm a candidate fix: guard 5 asserts that the shipped client still behaves like `upstream`, so a
+fix makes it behave like `patched` instead. Guards 1–4 are independent of the provider and continue
+to pass either way.
 
 ## Observed output
 
@@ -177,22 +183,28 @@ Read the two columns separately, because they prove different things:
   hermetic mode (a fake token) and live mode (a real `gho_` token) despite those being different
   lengths.
 
-Both are asserted in-process rather than printed, because the cache never stores the raw
-credential and the harness should not reintroduce it into output. (Worth knowing before pointing
-anyone at an on-disk `cache.db`: the token is not in there.)
+Both are asserted in-process rather than printed. The cache stores only the digest, never the raw
+credential, and the harness does not reintroduce one into its output — which is also worth knowing
+before inspecting an on-disk `cache.db`.
 
-## Relationship to the tests on the fix branch
+## Scope: this is a demonstration, not a regression test
 
 There is deliberately no `_test.go` here. This is a `main` you run and read.
 
-A `go test` that only passes inside this repository is weaker evidence for an upstream reader — or
-for the `ghct` maintainer — than a program they can run against the libraries themselves. That job
-is already done elsewhere: `internal/ghclient/transport_test.go` on
-`garnertb/fix-cache-transport-ordering` pins the regression in CI.
+The reasoning: a `go test` that only passes inside this repository asks a reader to trust this
+repository. A program that builds the two chains from the pinned libraries and runs them does not,
+and it can be lifted out and run against `github-conditional-http-transport` on its own.
 
-The division is intentional: **those tests pin the regression, this repro proves it to an
-outsider.** The cost is that this directory does not run in CI and can rot silently against a future
-`ghct` release, so treat a failure here as "re-read the library", not "the bug is back".
+The trade-off is that this directory is not wired into CI and can rot against a future `ghct`
+release. A failure here means "re-read the library", not necessarily "the bug is back". Pinning the
+behaviour in CI is a separate job, and belongs next to the fix in `internal/ghclient` rather than
+here.
+
+## The fix
+
+Move `oauth2.Transport` so that it wraps ghct rather than sitting beneath it — that is, apply it
+after the cache instead of before. The `patched` chain in [`chains.go`](./chains.go) is exactly that
+ordering, and is the only difference between the two library-only chains.
 
 ## Who is affected
 
@@ -213,21 +225,21 @@ outsider.** The cost is that this directory does not run in CI and can rot silen
   [`getRESTClientOptions`][rest-opts].
 
 > **Note on the `provider` row in the table.** That scenario calls
-> [`NewTokenRESTClient`][rest-client] directly and supplies its own `CachePath`, which bypasses the
-> `MkdirTemp` guard above. That is deliberate — it keeps the cache inside a temp dir the harness can
-> reopen and inspect. It does not affect what the row demonstrates: the ordering bug lives in
-> [`newTransport`][newTransport], which is reached identically either way, and `CachePath`
-> only determines where the store file sits. Do not read `filepath.Join("", ...)` behaviour off this
-> harness; it is unreachable through the provider itself.
+> [`NewTokenRESTClient`][rest-client] directly and supplies its own `CachePath`, bypassing the
+> `MkdirTemp` guard above so the store stays in a temp dir the harness can reopen and inspect. This
+> does not affect what the row demonstrates — the ordering lives in [`newTransport`][newTransport],
+> which is reached identically either way, and `CachePath` only decides where the store file sits.
+> It does mean cache *location* behaviour should not be read off this harness.
 
 ## What this does not prove
 
-- **It does not prove credential rotation breaks caching.** It does not, and any claim that it does
-  is wrong. [`addConditionalHeaders`][conditional] has three branches, not two: [no entry][branch-1]
+- **It does not show that credential rotation breaks caching.** Rotation is handled.
+  [`addConditionalHeaders`][conditional] has three branches, not two: [no entry][branch-1]
   (speculative `[]` guess), [entry with a matching vary marker][branch-2] (reuse the stored ETag),
   and [entry with a *non-matching* marker][branch-3] (**recompute** the expected ETag from current
-  headers plus the cached body). A failed vary check is the slower path, not a miss. It works
-  correctly once `Authorization` is visible.
+  headers plus the cached body). A failed vary check selects the slower path; it is not a miss, and
+  it behaves correctly once `Authorization` is visible. Worth stating because a zero hit rate
+  invites rotation as an explanation, and that would be the wrong lead.
 - **It does not prove the hermetic origin's ETag rule is byte-for-byte GitHub's.** See below. The
   live mode is what removes that dependency.
 - **It says nothing about non-cacheable requests.** ghct
@@ -241,9 +253,13 @@ Read literally, that emits a separator for a header that is absent. ghct does no
 value, no colon — when a header is missing. This origin follows ghct's semantics.
 
 For these requests the two readings coincide (`Accept` and `Authorization` are always present,
-`Cookie` never is), so it does not affect the result. But it means the hermetic mode shares one
-assumption with the library it is testing. The live mode does not: it runs against real GitHub and
-reproduces the same 0-vs-3 split with no formula of ours involved.
+`Cookie` never is), so the result is unaffected. It does mean hermetic mode shares one assumption
+with the library under test. Live mode does not: it runs against real GitHub, where the ETag rule is
+GitHub's own, and reproduces the same 0-vs-3 split.
+
+Anyone building their own origin from the shorthand formula should note this. Emitting
+`Accept:Auth::body` where ghct computes `Accept:Auth:body` produces a mismatch on every request, and
+makes a correctly ordered chain look broken.
 
 [ghct-tree]: https://github.com/bored-engineer/github-conditional-http-transport/tree/94778cbb26ea34bb63c577dfffaa99ebfb59e1cc
 [prov-tree]: https://github.com/integrations/terraform-provider-github/tree/67f3fd10bda01461da6241543c1cd07e8e553f86
