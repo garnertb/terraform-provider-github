@@ -159,6 +159,41 @@ patched     none                    200 x4              3            present, le
 live cache hits: upstream=0 patched=3 (of 4 requests)
 ```
 
+### Why `len=44` is a consistency check, not a coincidence
+
+The stored marker is not the token. [`transport.go:169-171`][store-hash] replaces the header value
+with [`HashToken(vals[0])`][hash-token] before writing it. `HashToken` strips the `Bearer ` /
+`token ` / `Basic ` prefix and returns `base64(sha256(bare token))`. A SHA-256 digest is 32 bytes,
+and `base64.StdEncoding` of 32 bytes is always 44 characters — regardless of how long the token is.
+
+Read the two columns separately, because they prove different things:
+
+- **Presence** of the marker is the discriminator. It is only written when
+  [`len(vals) > 0`][store-path], so its absence in the upstream row means `ghct` saw no
+  `Authorization` header at all. That is the bug.
+- **`len=44`** only confirms the stored value is a digest rather than a raw credential. It is *not*
+  additional evidence that a token was present — `HashToken("")` is also 44 characters. It is a
+  sanity check that the harness is reading the field it thinks it is, and it holds identically in
+  hermetic mode (a fake token) and live mode (a real `gho_` token) despite those being different
+  lengths.
+
+Both are asserted in-process rather than printed, because the cache never stores the raw
+credential and the harness should not reintroduce it into output. (Worth knowing before pointing
+anyone at an on-disk `cache.db`: the token is not in there.)
+
+## Relationship to the tests on the fix branch
+
+There is deliberately no `_test.go` here. This is a `main` you run and read.
+
+A `go test` that only passes inside this repository is weaker evidence for an upstream reader — or
+for the `ghct` maintainer — than a program they can run against the libraries themselves. That job
+is already done elsewhere: `internal/ghclient/transport_test.go` on
+`garnertb/fix-cache-transport-ordering` pins the regression in CI.
+
+The division is intentional: **those tests pin the regression, this repro proves it to an
+outsider.** The cost is that this directory does not run in CI and can rot silently against a future
+`ghct` release, so treat a failure here as "re-read the library", not "the bug is back".
+
 ## Who is affected
 
 - [`Cache: true` is set unconditionally][cache-true] for the non-legacy client.
@@ -208,6 +243,8 @@ reproduces the same 0-vs-3 split with no formula of ours involved.
 [prov-tree]: https://github.com/integrations/terraform-provider-github/tree/67f3fd10bda01461da6241543c1cd07e8e553f86
 
 [store-path]: https://github.com/bored-engineer/github-conditional-http-transport/blob/94778cbb26ea34bb63c577dfffaa99ebfb59e1cc/transport.go#L165-L174
+[store-hash]: https://github.com/bored-engineer/github-conditional-http-transport/blob/94778cbb26ea34bb63c577dfffaa99ebfb59e1cc/transport.go#L169-L171
+[hash-token]: https://github.com/bored-engineer/github-conditional-http-transport/blob/94778cbb26ea34bb63c577dfffaa99ebfb59e1cc/hash.go#L40-L61
 [vary-prefix]: https://github.com/bored-engineer/github-conditional-http-transport/blob/94778cbb26ea34bb63c577dfffaa99ebfb59e1cc/vary.go#L10-L11
 [vary-check]: https://github.com/bored-engineer/github-conditional-http-transport/blob/94778cbb26ea34bb63c577dfffaa99ebfb59e1cc/vary.go#L21-L25
 [hashtoken]: https://github.com/bored-engineer/github-conditional-http-transport/blob/94778cbb26ea34bb63c577dfffaa99ebfb59e1cc/hash.go#L40-L61
