@@ -67,9 +67,14 @@ wrong `If-None-Match` forever.
 > Note: the original bug report referenced the store path as `cht.go`. In v0.0.7 that code lives in
 > `transport.go`; the line number and logic are otherwise as described.
 
-The doc comment on `newTransport` already described the intended ordering ("wraps the provided token
-source with OAuth2 authentication, adds conditional request caching"), which suggests the ordering
-was an accident rather than a deliberate tradeoff.
+The doc comment on `newTransport` lists the layers as "wraps the provided token source with OAuth2
+authentication, adds conditional request caching, logging, and retry logic". This was originally
+read as describing the *intended* ordering and therefore as evidence that the implementation had
+drifted from it. That reading does not hold: the list matches the **construction** sequence of the
+code exactly (`oauth2`, then `ghct`, then `logging`, then retry). Since RoundTripper chains execute
+outermost-first, construction order is the reverse of execution order — but the comment never claims
+an execution order, so it is evidence of neither intent nor accident. It is simply silent on the
+question.
 
 ## Fix
 
@@ -135,8 +140,22 @@ GitHub App installation tokens are handed out with as little as 30 seconds of re
 would put a dead credential on the wire and surface as an unretried `401`. Personal access tokens use
 `oauth2.StaticTokenSource` and were never affected.
 
-Keeping oauth2 inside the waiting layers restores the guarantee the original ordering had by
-accident: every attempt that reaches the wire carries a token minted moments earlier.
+Keeping oauth2 inside the waiting layers preserves a property the original ordering also had: every
+attempt that reaches the wire carries a token minted moments earlier.
+
+Whether that property was intentional is not knowable from the repository, and this document does not
+claim it was accidental. What the history does show is that no source comment, commit message, or
+review note anywhere in the file's history states token freshness as a goal, and that the innermost
+position is simply the idiomatic form of `oauth2.Transport{Base: ...}` shown throughout the
+`golang.org/x/oauth2` documentation — so it is equally consistent with convention as with intent.
+
+The one substantive datum is provenance: `oauth2` and `ghct` were introduced **in the same commit**
+(`e286cb04`, "feat: Add new gh client implementation", #3448), with `ghct` placed directly outside
+`oauth2` — the position that prevents the cache from ever seeing `Authorization`. The caching feature
+was therefore non-functional from the moment it was added; this is not a later regression. If the
+innermost placement was a deliberate freshness tradeoff, it was made without recording the cost to
+the feature being introduced alongside it. Either way, the reordering below is chosen to satisfy both
+properties explicitly rather than to rely on either having been intended.
 
 Moving `ghct` below the rate limiter costs nothing. It rewrites only `304` responses; every other
 status passes through untouched (`transport.go:156-193`), so a real `403` still reaches limit
@@ -196,7 +215,8 @@ verbatim. If either dependency changes, those tests will fail even though the pr
 ## Follow-up (fixed): `Authorization` was visible to the logging transport
 
 `oauth2.Transport` used to sit *inside* `logging.NewLoggingHTTPTransport`, so the logging transport
-ran first and dumped the request before the credential was attached — redaction by accident. The
+ran first and dumped the request before the credential was attached. The token was therefore absent
+from the dump — not because anything redacted it, but because it had not been added yet. The
 reorder puts oauth2 above logging, so the logging transport now sees the fully-authenticated request.
 
 `helper/logging.NewLoggingHTTPTransport` (terraform-plugin-sdk v2.40.1) calls
@@ -233,7 +253,8 @@ and asserts the token appears verbatim.
 
 ### Why not move logging above oauth2
 
-That restores the old redaction-by-accident but loses the transport's stated purpose. Logging would
+That restores the property that the token is absent from the debug dump, but loses the transport's
+stated purpose. Logging would
 run before `ghct` adds `If-None-Match`, before retry, and before rate limiting — so it would show
 neither conditional requests, nor 304 revalidations, nor retried attempts, and would log
 cache-served responses instead of wire responses. Rejected.
