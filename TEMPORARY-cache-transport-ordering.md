@@ -19,6 +19,18 @@ cross-process persistence — choosing where the cache lives so it survives betw
 enabling the cache. Users who set it lost that cross-run reuse on top of the in-run loss everyone
 else took.
 
+Two bounds on that scope, stated so the claim above is not overread:
+
+- **The non-legacy client is itself opt-in.** `legacy_client` defaults to `true`
+  (`github/provider.go:163`, `EnvDefaultFunc("GITHUB_LEGACY_CLIENT", true)`), so the affected
+  population is users who explicitly set `legacy_client = false` or `GITHUB_LEGACY_CLIENT=false`,
+  not the default configuration. This plausibly explains how a ~0% hit rate went unnoticed: the
+  code path is off by default.
+- **The cache is REST-only.** `getGraphQLClientOptions`
+  (`internal/ghclient/options.go:42`) never sets `Cache`, while `getRESTClientOptions` does.
+  GraphQL traffic is unaffected either way, since it is all `POST` and `ghct` declines to cache
+  anything other than `GET`/`HEAD`. Benefit estimates should exclude v4 traffic.
+
 ## Mechanism
 
 `newTransport` in `internal/ghclient/transport.go` builds the RoundTripper chain inside-out. Before
@@ -224,6 +236,20 @@ of scoped to this chain. That is defence in depth — it would catch any future 
 that logs headers — at the cost of being a provider-wide policy rather than a local guarantee. The
 chain-scoped version is implemented here because it is self-contained and testable; the broader
 version is a maintainer's call.
+
+## Adjacent issues found, not fixed here
+
+Two pre-existing issues surfaced while validating the `cache_path` story. Both are out of scope for
+this change and are recorded only so the persistence advice above is not read as unqualified.
+
+- **A shared `cache_path` serialises concurrent processes.** `createCacheStore`
+  (`internal/ghclient/cache.go`) calls `ghctbbolt.Open(path, 0o600, nil, nil)`; the `nil` options
+  leave bbolt's `Timeout` at `0`, which means wait for the file lock *indefinitely* rather than
+  fail. Two Terraform runs pointed at the same `cache_path` will block one another rather than
+  error, and the store is never closed. Anyone sharing a cache directory across parallel CI jobs
+  should know this before doing so.
+- **Temporary cache directories are never cleaned up.** When `cache_path` is unset, the
+  `os.MkdirTemp` fallback leaks one directory per run.
 
 ## Note on branch base
 
