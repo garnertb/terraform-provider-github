@@ -30,7 +30,7 @@ invisible to it, three paths break:
 | # | Path | Source | What goes wrong |
 |---|---|---|---|
 | 1 | store | [`transport.go:165-174`][store-path] | `req.Header.Values("Authorization")` is empty, so the [`X-Varied-Authorization`][vary-prefix] marker is never written into the entry |
-| 2 | vary / reuse | [`vary.go:21-25`][vary-check] | compares [`HashToken("")`][hashtoken] — a non-empty digest of the empty string — against a missing stored value, so it is always false |
+| 2 | vary / reuse | [`vary.go:21-25`][vary-check] | compares [`HashToken("")`][hash-token] — a non-empty digest of the empty string — against a missing stored value, so it is always false |
 | 3 | recompute | [`conditional.go:45-50`][branch-3] via [`hash.go:28-34`][hash-loop] | recomputes the expected ETag *without* `Authorization`, while GitHub hashed *with* it |
 
 Result: a cache hit rate of ~0% for authenticated users.
@@ -197,22 +197,28 @@ outsider.** The cost is that this directory does not run in CI and can rot silen
 ## Who is affected
 
 - [`Cache: true` is set unconditionally][cache-true] for the non-legacy client.
-- [`cache_path` defaults to `""`][cache-path-schema], which only makes `CacheBasePath` empty. That
-  value is [joined with a per-source ref][cache-join] such as `token-rest`, and
-  [`createCacheStore` only rejects a genuinely empty path][create-store]. `filepath.Join("", "token-rest")`
-  is `"token-rest"`, so an unset `cache_path` still produces a cache — at a *relative*
-  `token-rest/cache.db` under the process working directory. It chooses where the cache lives, not
-  whether it exists.
-- **Incidental finding, unrelated to the ordering bug:** that behaviour contradicts the attribute's
-  own documentation, which states "if not set there will be no caching between runs"
-  ([`provider.go:170`][cache-path-schema]). As implemented, caching is always on for the non-legacy
-  client, and an unset `cache_path` writes a cache directory into whatever directory Terraform
-  happens to be run from. Worth a separate issue.
+- [`cache_path` defaults to `""`][cache-path-schema], but that does **not** disable the cache. Every
+  path into the non-legacy client goes through one of three source constructors —
+  [`NewTokenSource`][src-token], [`NewAppSource`][src-app], [`NewAnonymousSource`][src-anon] — and
+  each begins with the same guard: if `opts.Cache && opts.CacheBasePath == ""`, it allocates a fresh
+  `os.MkdirTemp` directory and uses that. So an unset `cache_path` gives you a cache in a new
+  temporary directory per process, discarded when the run ends. It chooses where the cache lives and
+  how long it survives, not whether it exists.
+- The attribute's description — ["if not set there will be no caching **between runs**"][cache-path-schema]
+  — is accurate. Caching still happens *within* a run; only persistence across runs is lost.
 - **However**, [`legacy_client` defaults to `true`][legacy-default], so the affected population is
   users who explicitly set `legacy_client = false`. That is the likely reason a ~0% hit rate went
   unnoticed. Do not overstate this.
 - The cache is REST-only: [`getGraphQLClientOptions` never sets `Cache`][graphql-opts], unlike
   [`getRESTClientOptions`][rest-opts].
+
+> **Note on the `provider` row in the table.** That scenario calls
+> [`NewTokenRESTClient`][rest-client] directly and supplies its own `CachePath`, which bypasses the
+> `MkdirTemp` guard above. That is deliberate — it keeps the cache inside a temp dir the harness can
+> reopen and inspect. It does not affect what the row demonstrates: the ordering bug lives in
+> [`newTransport`][newTransport], which is reached identically either way, and `CachePath`
+> only determines where the store file sits. Do not read `filepath.Join("", ...)` behaviour off this
+> harness; it is unreachable through the provider itself.
 
 ## What this does not prove
 
@@ -247,7 +253,6 @@ reproduces the same 0-vs-3 split with no formula of ours involved.
 [hash-token]: https://github.com/bored-engineer/github-conditional-http-transport/blob/94778cbb26ea34bb63c577dfffaa99ebfb59e1cc/hash.go#L40-L61
 [vary-prefix]: https://github.com/bored-engineer/github-conditional-http-transport/blob/94778cbb26ea34bb63c577dfffaa99ebfb59e1cc/vary.go#L10-L11
 [vary-check]: https://github.com/bored-engineer/github-conditional-http-transport/blob/94778cbb26ea34bb63c577dfffaa99ebfb59e1cc/vary.go#L21-L25
-[hashtoken]: https://github.com/bored-engineer/github-conditional-http-transport/blob/94778cbb26ea34bb63c577dfffaa99ebfb59e1cc/hash.go#L40-L61
 [vary-headers]: https://github.com/bored-engineer/github-conditional-http-transport/blob/94778cbb26ea34bb63c577dfffaa99ebfb59e1cc/hash.go#L13-L18
 [hash-loop]: https://github.com/bored-engineer/github-conditional-http-transport/blob/94778cbb26ea34bb63c577dfffaa99ebfb59e1cc/hash.go#L28-L34
 [conditional]: https://github.com/bored-engineer/github-conditional-http-transport/blob/94778cbb26ea34bb63c577dfffaa99ebfb59e1cc/conditional.go#L13-L53
@@ -267,10 +272,11 @@ reproduces the same 0-vs-3 split with no formula of ours involved.
 [oauth2-innermost]: https://github.com/integrations/terraform-provider-github/blob/67f3fd10bda01461da6241543c1cd07e8e553f86/internal/ghclient/transport.go#L35-L40
 [ghct-outermost]: https://github.com/integrations/terraform-provider-github/blob/67f3fd10bda01461da6241543c1cd07e8e553f86/internal/ghclient/transport.go#L61-L68
 [rest-client]: https://github.com/integrations/terraform-provider-github/blob/67f3fd10bda01461da6241543c1cd07e8e553f86/internal/ghclient/rest.go#L40-L44
-[create-store]: https://github.com/integrations/terraform-provider-github/blob/67f3fd10bda01461da6241543c1cd07e8e553f86/internal/ghclient/cache.go#L13-L28
-[cache-join]: https://github.com/integrations/terraform-provider-github/blob/67f3fd10bda01461da6241543c1cd07e8e553f86/internal/ghclient/options.go#L25-L39
 [rest-opts]: https://github.com/integrations/terraform-provider-github/blob/67f3fd10bda01461da6241543c1cd07e8e553f86/internal/ghclient/options.go#L25-L39
 [graphql-opts]: https://github.com/integrations/terraform-provider-github/blob/67f3fd10bda01461da6241543c1cd07e8e553f86/internal/ghclient/options.go#L42-L54
 [cache-true]: https://github.com/integrations/terraform-provider-github/blob/67f3fd10bda01461da6241543c1cd07e8e553f86/github/provider.go#L609-L618
 [cache-path-schema]: https://github.com/integrations/terraform-provider-github/blob/67f3fd10bda01461da6241543c1cd07e8e553f86/github/provider.go#L166-L171
 [legacy-default]: https://github.com/integrations/terraform-provider-github/blob/67f3fd10bda01461da6241543c1cd07e8e553f86/github/provider.go#L160-L165
+[src-token]: https://github.com/integrations/terraform-provider-github/blob/67f3fd10bda01461da6241543c1cd07e8e553f86/internal/ghclient/token.go#L20-L27
+[src-app]: https://github.com/integrations/terraform-provider-github/blob/67f3fd10bda01461da6241543c1cd07e8e553f86/internal/ghclient/app.go#L45-L51
+[src-anon]: https://github.com/integrations/terraform-provider-github/blob/67f3fd10bda01461da6241543c1cd07e8e553f86/internal/ghclient/anonymous.go#L20-L27
