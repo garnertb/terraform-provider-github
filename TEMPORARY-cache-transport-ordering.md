@@ -50,14 +50,31 @@ A RoundTripper chain executes **outermost-first**: the outermost transport sees 
 any inner transport has touched it. `oauth2.Transport` attaches the `Authorization` header on the way
 down, so every transport above it — including `ghct` — observed a request with no credential.
 
+To be precise about what did *not* break: authentication itself was unaffected. `oauth2` still ran,
+just below the cache, so every request reached GitHub fully authenticated. The bug is that `ghct`
+could not *see* the credential it needed in order to compute a usable validator — not that the
+credential was missing from the wire. The repro's emulated origin rejects anonymous requests with a
+`401` specifically so this cannot be fudged, and observed zero of them under either ordering.
+
 That matters because GitHub varies its ETags on the credential. GitHub computes an ETag as
 `sha256(Accept + ":" + Authorization + ":" + Cookie + ":" + body)` and advertises
-`Vary: Accept, Authorization, ...` on the response. The `ghct` library is built specifically around
-that behaviour, and all three of its `Authorization`-dependent paths broke:
+`Vary: Accept, Authorization, ...` on the response.
+
+That shorthand is only exact when all three headers are present exactly once, and it is worth stating
+precisely because a literal reading of it will not reproduce. `ghct`'s `Hash` (`hash.go`) iterates
+`requestHeaders.Values(name)` over `Accept`, `Authorization`, `Cookie` in that fixed order and writes
+`value + ":"` for each **present** value, then the body. An **absent** header contributes nothing at
+all — not an empty field, and not a separator. So with no `Cookie` (the normal case) the digest is
+over `Accept:Authorization:body`, not `Accept:Authorization::body`. A multi-valued header
+contributes one `value + ":"` per value. Anyone building a test origin from the literal formula above
+will produce a digest that never matches, and will conclude the fix does not work.
+
+The `ghct` library is built specifically around that behaviour, and all three of its
+`Authorization`-dependent paths broke:
 
 | path | file (v0.0.7) | behaviour without `Authorization` |
 | --- | --- | --- |
-| store | `transport.go` (~line 169) | Iterates the response's `Vary` headers and copies matching **request** headers into `X-Varied-*` markers. `req.Header.Values("Authorization")` was empty, so `X-Varied-Authorization` was never written. |
+| store | `transport.go:168` | Iterates the response's `Vary` headers and copies matching **request** headers into `X-Varied-*` markers. `req.Header.Values("Authorization")` was empty, so `X-Varied-Authorization` was never written. (The enclosing `200 && GET && Etag != ""` guard is at `:160`. Note `:170` stores `HashToken(...)`, not the raw token.) |
 | reuse | `vary.go` (~line 23) | Compares `HashToken(req.Header.Get("Authorization"))` against the stored `X-Varied-Authorization`. `HashToken("")` is a non-empty digest of the empty string, so it never matched the missing stored value — always false. |
 | recompute | `hash.go` (~line 29) / `conditional.go` | With the vary check false, the library recomputes the expected ETag over the cached body. It hashed **without** `Authorization` while GitHub hashed **with** it, so the resulting `If-None-Match` was guaranteed to mismatch and GitHub always answered `200`. |
 
@@ -163,6 +180,36 @@ detection intact. Rate limit accounting also stays accurate: the `x-ratelimit-*`
 revalidation come from the fresh `304`, and the limiter observes them on the way back out.
 
 ## Evidence
+
+### Standalone reproduction (independently re-run)
+
+A self-contained program on branch `garnertb/cache-ordering-repro`
+(`TEMPORARY-repro/cache-ordering/`) reproduces the bug from the libraries alone. It deliberately
+builds both chains itself rather than importing `internal/ghclient`, so the ordering result does not
+depend on anything in this repository — though it also drives the provider's own
+`ghclient.NewTokenRESTClient` as a separate scenario, to tie the library-level proof to shipped code.
+
+Hermetic mode (no credentials, `httptest` origin implementing GitHub's documented behaviour), and
+live mode against `api.github.com`, both with 4 identical GETs per chain:
+
+| ordering | origin statuses (hermetic) | cache hits (hermetic) | cache hits (live) | stored `X-Varied-Authorization` |
+| --- | --- | --- | --- | --- |
+| upstream | `200 x4` | 0 | 0 | absent |
+| patched | `200 x1, 304 x3` | 3 | 3 | present (len 44) |
+| provider (as shipped) | `200 x4` | 0 | — | absent |
+
+Both modes were re-run and confirmed independently of the session that wrote them.
+
+Two details matter when reading this:
+
+- **Cache hits are invisible from the client.** `ghct` rewrites a wire `304` into a `200` before
+  returning it, so client-side status counts show `200` either way. Hits must be counted at the
+  origin, or read from the `X-Cache` / `Cache-Status` response headers.
+- **Hermetic mode cannot independently validate GitHub's ETag algorithm**, because its origin
+  necessarily implements the same digest convention as the library under test. That shared
+  assumption is what the live run exists to remove.
+
+### Earlier measurements
 
 Measured before the change was written, using a standalone Go harness against the live GitHub API.
 These numbers are reproduced from that run and were **not** re-measured as part of this commit.
