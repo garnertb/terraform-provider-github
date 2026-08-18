@@ -106,6 +106,19 @@ sent, but anyone using `TF_LOG_PROVIDER=DEBUG` output to count API requests is c
 attempts**, not logical requests. In practice the totals barely move between cold and warm runs
 because GitHub conditional requests always revalidate; what changes is the `200`/`304` split.
 
+This creates a diagnostic trap that the fix itself introduces, so it is worth stating plainly.
+`ghct` reports its own decisions through the `Cache-Status` (RFC 9211) and `X-Cache` response
+headers — but it sets them on the response it returns *upward*, after rewriting a `304` into the
+cached `200`. Because `logging` sits below `ghct`, those headers do not exist yet when the request
+is logged, and the `304` the log records has already been converted by the time anything above sees
+it. **So a healthy cache and a dead one look nearly identical in `TF_LOG` output**, and the obvious
+debugging instinct — turn on debug logging, observe that the request count did not drop, conclude
+the cache is not working — reaches the wrong answer.
+
+To actually observe cache behaviour, inspect the response headers at the call site (harness or
+client level) where `Cache-Status`/`X-Cache` are present, or compare the `200`/`304` split rather
+than the request total.
+
 ## Token freshness: why oauth2 is not the outermost layer
 
 `oauth2.Transport` calls `Source.Token()` once per `RoundTrip`. Placing it outermost stamps the
