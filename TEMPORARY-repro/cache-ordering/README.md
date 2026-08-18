@@ -208,7 +208,7 @@ outsider.** The cost is that this directory does not run in CI and can rot silen
   — is accurate. Caching still happens *within* a run; only persistence across runs is lost.
 - **However**, [`legacy_client` defaults to `true`][legacy-default], so the affected population is
   users who explicitly set `legacy_client = false`. That is the likely reason a ~0% hit rate went
-  unnoticed. Do not overstate this.
+  unnoticed.
 - The cache is REST-only: [`getGraphQLClientOptions` never sets `Cache`][graphql-opts], unlike
   [`getRESTClientOptions`][rest-opts].
 
